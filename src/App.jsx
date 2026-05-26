@@ -246,7 +246,6 @@ const ACCIDENTAL_TO_TEXT = { "-2": "𝄫", "-1": "♭", 0: "", 1: "♯", 2: "�
 const ACCIDENTAL_TO_ASCII = { "-2": "bb", "-1": "b", 0: "", 1: "#", 2: "##" };
 const SHARP_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-const TRAINER_MODES = ["melodicFunctions", "harmonicFunctions", "tonalFunctions"];
 const MODE_LABELS = {
   melodicFunctions: "Funciones melódicas",
 };
@@ -271,8 +270,8 @@ const KEY_OPTIONS = [
 
 const CLEFS = [
   { key: "treble", label: "Clave de Sol", symbol: "𝄞", tag: "", vex: "treble" },
-  { key: "treble8va", label: "Clave de Sol 8va alta", symbol: "𝄞", tag: "8va", clefAnnotation: "8va", vex: "treble" },
-  { key: "treble15ma", label: "Clave de Sol 15ma alta", symbol: "𝄞", tag: "15ma", clefAnnotation: "15ma", vex: "treble" },
+  { key: "treble8va", label: "Clave de Sol 8va alta", symbol: "𝄞", tag: "8va", clefAnnotation: "8va", vex: "treble", displayOctaveShift: -1 },
+  { key: "treble8vb", label: "Clave de Sol 8va baja", symbol: "𝄞", tag: "8vb", clefAnnotation: "8vb", vex: "treble", displayOctaveShift: 1 },
   { key: "soprano", label: "Clave de Do en I", symbol: "𝄡", tag: "I", vex: "soprano" },
   { key: "mezzo", label: "Clave de Do en II", symbol: "𝄡", tag: "II", vex: "mezzo-soprano" },
   { key: "alto", label: "Clave de Do en III", symbol: "𝄡", tag: "III", vex: "alto" },
@@ -293,7 +292,7 @@ const CADENCE_INSTRUMENT = "piano";
 const CLEF_COMFORT_RANGES = {
   treble: { low: 57, high: 84, center: 67 },
   treble8va: { low: 69, high: 96, center: 79 },
-  treble15ma: { low: 81, high: 108, center: 91 },
+  treble8vb: { low: 45, high: 72, center: 55 },
   soprano: { low: 60, high: 84, center: 72 },
   mezzo: { low: 57, high: 81, center: 69 },
   alto: { low: 53, high: 77, center: 65 },
@@ -811,99 +810,529 @@ function harmonicChordFullLabel(chordKey) {
   return HARMONIC_CHORD_FULL_LABELS[chordKey] ?? HARMONIC_CHORD_DEFS[chordKey]?.label ?? chordKey;
 }
 
+
+// Convierte "C4", "C#4", "Cb4" → MIDI (C4 = 60).
+function auralSampleNoteToMidi(name) {
+  const match = /^([A-G])([#b]?)(-?\d+)$/.exec(String(name));
+  if (!match) return null;
+  const [, letter, accidental, octaveStr] = match;
+  const base = NATURAL_PCS[letter];
+  const offset = accidental === "#" ? 1 : accidental === "b" ? -1 : 0;
+  return base + offset + (parseInt(octaveStr, 10) + 1) * 12;
+}
+
+// Mini-sampler Web Audio para las muestras propias de Método Aural.
+// Carga los MP3 del banco, busca el sample más cercano y lo repitchea.
+function createUrlSampleBank(ctx, samples, routingGain) {
+  if (!Array.isArray(samples) || samples.length === 0) return null;
+  const decoded = [];
+  const activeVoices = new Set();
+
+  async function decodeUrl(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status} en ${url}`);
+    const arrayBuffer = await response.arrayBuffer();
+    return await new Promise((resolve, reject) => {
+      try {
+        const maybe = ctx.decodeAudioData(arrayBuffer, resolve, reject);
+        if (maybe && typeof maybe.then === "function") maybe.then(resolve, reject);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async function loadOne(sample) {
+    const candidates = [sample.url, ...(sample.urlFallbacks ?? [])];
+    let lastError = null;
+    for (const url of candidates) {
+      try {
+        const buffer = await decodeUrl(url);
+        decoded.push({ midi: sample.midi, buffer, noteName: sample.noteName });
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    console.warn(`[aural] sample ${sample.noteName ?? sample.midi}: ${lastError?.message ?? lastError}`);
+  }
+
+  const loaded = Promise.all(samples.map(loadOne)).then(() => {
+    decoded.sort((a, b) => a.midi - b.midi);
+    console.info(`[aural] sample bank listo: ${decoded.length}/${samples.length} samples cargados`);
+  });
+
+  function findNearest(targetMidi) {
+    if (decoded.length === 0) return null;
+    let nearest = decoded[0];
+    let bestDist = Math.abs(targetMidi - nearest.midi);
+    for (let i = 1; i < decoded.length; i += 1) {
+      const dist = Math.abs(targetMidi - decoded[i].midi);
+      if (dist < bestDist) {
+        nearest = decoded[i];
+        bestDist = dist;
+      }
+    }
+    return nearest;
+  }
+
+  function start(options = {}) {
+    if (decoded.length === 0) return null;
+    const targetMidi = typeof options.note === "number" ? options.note : auralSampleNoteToMidi(options.note);
+    if (!Number.isFinite(targetMidi)) return null;
+    const nearest = findNearest(targetMidi);
+    if (!nearest) return null;
+
+    const startTime = Number.isFinite(options.time) ? options.time : ctx.currentTime;
+    const duration = Number.isFinite(options.duration) && options.duration > 0 ? options.duration : 1.2;
+    const rawGain = Number.isFinite(options.gain) ? options.gain : 0.9;
+    const safeGain = Math.max(0.0001, Math.min(1.15, rawGain * 0.42));
+    const release = Math.min(0.24, Math.max(0.05, duration * 0.18));
+
+    const source = ctx.createBufferSource();
+    source.buffer = nearest.buffer;
+    source.playbackRate.value = Math.pow(2, (targetMidi - nearest.midi) / 12);
+
+    const voiceGain = ctx.createGain();
+    voiceGain.gain.setValueAtTime(safeGain, Math.max(startTime, ctx.currentTime));
+    source.connect(voiceGain);
+    voiceGain.connect(routingGain);
+
+    try {
+      source.start(Math.max(startTime, ctx.currentTime));
+    } catch {
+      try { source.start(ctx.currentTime); } catch { return null; }
+    }
+
+    const stopTime = startTime + duration;
+    try {
+      voiceGain.gain.setValueAtTime(safeGain, Math.max(stopTime - release, ctx.currentTime));
+      voiceGain.gain.exponentialRampToValueAtTime(0.0001, stopTime + release);
+      source.stop(stopTime + release + 0.04);
+    } catch {}
+
+    const voice = { source, voiceGain };
+    activeVoices.add(voice);
+    const cleanup = () => {
+      activeVoices.delete(voice);
+      try { voiceGain.disconnect(); } catch {}
+    };
+    source.onended = cleanup;
+
+    return {
+      stop() {
+        try { source.stop(); } catch {}
+        cleanup();
+      },
+      disconnect() {
+        cleanup();
+      },
+    };
+  }
+
+  return {
+    loaded,
+    __routingGain: routingGain,
+    start,
+    play(noteName, startTime, options = {}) {
+      return start({ note: noteName, time: startTime, duration: options.duration, gain: options.gain });
+    },
+    stop() {
+      for (const voice of Array.from(activeVoices)) {
+        try { voice.source.stop(); } catch {}
+        try { voice.voiceGain.disconnect(); } catch {}
+        activeVoices.delete(voice);
+      }
+    },
+    disconnect() {
+      try { routingGain.disconnect(); } catch {}
+    },
+  };
+}
+
+const AURAL_R2_BASE_URL = "https://pub-bef53cc87d594913a44717804120cdda.r2.dev";
+
+function r2PathUrl(...segments) {
+  return `${AURAL_R2_BASE_URL.replace(/\/$/, "")}/${segments
+    .filter((segment) => segment !== undefined && segment !== null && `${segment}`.length)
+    .map((segment) => encodeURIComponent(`${segment}`))
+    .join("/")}`;
+}
+
+// Tus archivos usan `s` para sostenidos: G#3 → Gs3, A#3 → As3.
+function r2SampleNoteId(noteName) {
+  return `${noteName}`.replace(/#/g, "s").replace(/♯/g, "s").replace(/♭/g, "b");
+}
+
+function uniqueStrings(items) {
+  return [...new Set(items.filter((item) => typeof item === "string" && item.length))];
+}
+
+// Manifiesto editable de tus muestras R2. La app crea las URLs automáticamente:
+// https://...r2.dev/samples/<folder>/<archivo>.mp3
+//
+// Si algún sample no suena, casi siempre es por un nombre de archivo distinto.
+// En ese caso basta editar `fileStems`, `notes` o añadir el archivo exacto en
+// `files`, sin tocar el resto del motor de audio.
+const AURAL_R2_SAMPLE_BANKS = {
+  clarinetBF: {
+    folder: "Clarinete-BF",
+    label: "Clarinete BF",
+    fallback: "voice",
+    sustain: true,
+    notes: ["D3", "F3", "G#3", "B3", "D4", "F4", "G#4", "B4", "D5", "F5", "G#5", "B5", "D6", "F6"],
+    files: {
+      D3: "01-D3_Clarinet_BF.mp3",
+      F3: "02-F3_Clarinet_BF.mp3",
+      "G#3": "03-Gs3_Clarinet_BF.mp3",
+      B3: "04-B3_Clarinet_BF.mp3",
+      D4: "05-D4_Clarinet_BF.mp3",
+      F4: "06-F4_Clarinet_BF.mp3",
+      "G#4": "07-Gs4_Clarinet_BF.mp3",
+      B4: "08-B4_Clarinet_BF.mp3",
+      D5: "09-D5_Clarinet_BF.mp3",
+      F5: "10-F5_Clarinet_BF.mp3",
+      "G#5": "11-Gs5_Clarinet_BF.mp3",
+      B5: "12-B5_Clarinet_BF.mp3",
+      D6: "13-D6_Clarinet_BF.mp3",
+      F6: "14-F6_Clarinet_BF.mp3",
+    },
+  },
+  bassoonSO: {
+    folder: "Fagot-SO",
+    label: "Fagot SO",
+    fallback: "voice",
+    sustain: true,
+    notes: ["A#1", "C#2", "E2", "G2", "A#2", "C#3", "E3", "G3", "A#3"],
+    files: {
+      "A#1": "01-As1_Fagot_SO.mp3",
+      "C#2": "02-Cs2_Fagot_SO.mp3",
+      E2: "03-E2_Fagot_SO.mp3",
+      G2: "04-G2_Fagot_SO.mp3",
+      "A#2": "05-As2_Fagot_SO.mp3",
+      "C#3": "06-Cs3_Fagot_SO.mp3",
+      E3: "07-E3_Fagot_SO.mp3",
+      G3: "08-G3_Fagot_SO.mp3",
+      "A#3": "09-As3_Fagot_SO.mp3",
+    },
+  },
+  fluteSPO: {
+    folder: "Flute-SPO",
+    label: "Flauta SPO",
+    fallback: "voice",
+    sustain: true,
+    notes: ["C4", "D#4", "F#4", "A4", "C5", "D#5", "F#5", "A5", "C6", "D#6", "F#6"],
+    files: {
+      C4: "01-C4_Flute_SPO.mp3",
+      "D#4": "02-Ds4_Flute_SPO.mp3",
+      "F#4": "03-Fs4_Flute_SPO.mp3",
+      A4: "04-A4_Flute_SPO.mp3",
+      C5: "05-C5_Flute_SPO.mp3",
+      "D#5": "06-Ds5_Flute_SPO.mp3",
+      "F#5": "07-Fs5_Flute_SPO.mp3",
+      A5: "08-A5_Flute_SPO.mp3",
+      C6: "09-C6_Flute_SPO.mp3",
+      "D#6": "10-Ds6_Flute_SPO.mp3",
+      "F#6": "11-Fs6_Flute_SPO.mp3",
+    },
+  },
+  oboeSW: {
+    folder: "Oboe-SW",
+    label: "Oboe SW",
+    fallback: "voice",
+    sustain: true,
+    notes: ["A#3", "C#4", "E4", "G4", "A#4", "C#5", "E5", "G5", "A#5", "C#6", "E6"],
+    files: {
+      "A#3": "1-As3_Oboe_SW.mp3",
+      "C#4": "2-Cs5_Oboe_SW.mp3",
+      E4: "3-E4_Oboe_SW.mp3",
+      G4: "4-G4_Oboe_SW.mp3",
+      "A#4": "5-As4_Oboe_SW.mp3",
+      "C#5": "6-Cs5_Oboe_SW.mp3",
+      E5: "7-E5_Oboe_SW.mp3",
+      G5: "8-G5_Oboe_SW.mp3",
+      "A#5": "9-As5_Oboe_SW.mp3",
+      "C#6": "10-Cs6_Oboe_SW.mp3",
+      E6: "11-E6_Oboe_SW.mp3",
+    },
+  },
+  choirCL: {
+    folder: "Choir-CL",
+    label: "Coro CL",
+    fallback: "voice",
+    sustain: true,
+    notes: ["D#2", "F#2", "A2", "C3", "D#3", "F#3", "A3", "C4", "D#4", "F#4", "A4", "C5", "D#5", "F#5", "A5"],
+    files: {
+      "D#2": "01-Ds2_Choir_CL.mp3",
+      "F#2": "02-Fs2_Choir_CL.mp3",
+      A2: "03-A2_Choir_CL.mp3",
+      C3: "04-C3_Choir_CL.mp3",
+      "D#3": "05-Ds3_Choir_CL.mp3",
+      "F#3": "06-Fs3_Choir_CL.mp3",
+      A3: "07-A3_Choir_CL.mp3",
+      C4: "08-C4_Choir_CL.mp3",
+      "D#4": "09-Ds4_Choir_CL.mp3",
+      "F#4": "10-Fs4_Choir_CL.mp3",
+      A4: "11-A4_Choir_CL.mp3",
+      C5: "12-C5_Choir_CL.mp3",
+      "D#5": "13-Ds5_Choir_CL.mp3",
+      "F#5": "14-Fs5_Choir_CL.mp3",
+      A5: "15-A5_Choir_CL.mp3",
+    },
+  },
+  hornSY: {
+    folder: "Corn-SY",
+    label: "Corno SY",
+    fallback: "organ",
+    sustain: true,
+    notes: ["D2", "F2", "G#2", "B2", "D3", "F3", "G#3", "B3", "D4", "F4", "G#4", "B4", "D5", "F5"],
+    files: {
+      D2: "01-D2_Horn_SY.mp3",
+      F2: "02-F2_Horn_SY.mp3",
+      "G#2": "03-Gs2_Horn_SY.mp3",
+      B2: "04-B2_Horn_SY.mp3",
+      D3: "05-D3_Horn_SY.mp3",
+      F3: "06-F3_Horn_SY.mp3",
+      "G#3": "07-Gs3_Horn_SY.mp3",
+      B3: "08-B3_Horn_SY.mp3",
+      D4: "09-D4_Horn_SY.mp3",
+      F4: "10-F4_Horn_SY.mp3",
+      "G#4": "11-Gs4_Horn_SY.mp3",
+      B4: "12-B4_Horn_SY.mp3",
+      D5: "13-D5_Horn_SY.mp3",
+      F5: "14-F5_Horn_SY.mp3",
+    },
+  },
+  oboeBF: {
+    folder: "Oboe-BF",
+    label: "Oboe BF",
+    fallback: "voice",
+    sustain: true,
+    notes: ["C4", "D#4", "F#4", "A4", "C5", "D#5", "F#5", "A5", "C6", "D#6", "F6"],
+    files: {
+      C4: "1-C4_Oboe_BF.mp3",
+      "D#4": "2-Ds4_Oboe_BF.mp3",
+      "F#4": "3-Fs4_Oboe_BF.mp3",
+      A4: "4-A4_Oboe_BF.mp3",
+      C5: "5-C5_Oboe_BF.mp3",
+      "D#5": "6-Ds5_Oboe_BF.mp3",
+      "F#5": "7-Fs5_Oboe_BF.mp3",
+      A5: "8-A5_Oboe_BF.mp3",
+      C6: "9-C6_Oboe_BF.mp3",
+      "D#6": "10-Ds6_Oboe_BF.mp3",
+      F6: "11-F6_Oboe_BF.mp3",
+    },
+  },
+  stringQuartetAB: {
+    folder: "StringQuartet-AB",
+    label: "Cuarteto de cuerdas AB",
+    fallback: "strings",
+    sustain: true,
+    notes: ["C2", "D#2", "F#2", "A2", "C3", "D#3", "F#3", "A3", "C4", "D#4", "F#4", "A4", "C5", "D#5", "F#5", "A5", "C6", "D#6", "F#6", "A6", "C7"],
+    files: {
+      C2: "01-C2_StringQuartet_AB.mp3",
+      "D#2": "02-Ds2_StringQuartet_AB.mp3",
+      "F#2": "03-Fs2_StringQuartet_AB.mp3",
+      A2: "04-A2_StringQuartet_AB.mp3",
+      C3: "05-C3_StringQuartet_AB.mp3",
+      "D#3": "06-Ds3_StringQuartet_AB.mp3",
+      "F#3": "07-Fs3_StringQuartet_AB.mp3",
+      A3: "08-A3_StringQuartet_AB.mp3",
+      C4: "09-C4_StringQuartet_AB.mp3",
+      "D#4": "10-Ds4_StringQuartet_AB.mp3",
+      "F#4": "11-Fs4_StringQuartet_AB.mp3",
+      A4: "12-A4_StringQuartet_AB.mp3",
+      C5: "13-C5_StringQuartet_AB.mp3",
+      "D#5": "14-Ds5_StringQuartet_AB.mp3",
+      "F#5": "15-Fs5_StringQuartet_AB.mp3",
+      A5: "16-A5_StringQuartet_AB.mp3",
+      C6: "17-C6_StringQuartet_AB.mp3",
+      "D#6": "18-Ds6_StringQuartet_AB.mp3",
+      "F#6": "19-Fs6_StringQuartet_AB.mp3",
+      A6: "20-A6_StringQuartet_AB.mp3",
+      C7: "21-C7_StringQuartet_AB.mp3",
+    },
+  },
+  tromboneBF: {
+    folder: "Trombone-BF",
+    label: "Trombón BF",
+    fallback: "organ",
+    sustain: true,
+    notes: ["A#1", "C#2", "E2", "G2", "A#2", "C#3", "E3", "G3", "A#3", "C#4", "E4", "G4", "A#4"],
+    files: {
+      "A#1": "01-As1_Trombone_BF.mp3",
+      "C#2": "02-Cs2_Trombone_BF.mp3",
+      E2: "03-E2_Trombone_BF.mp3",
+      G2: "04-G2_Trombone_BF.mp3",
+      "A#2": "05-As2_Trombone_BF.mp3",
+      "C#3": "06-Cs3_Trombone_BF.mp3",
+      E3: "07-E3_Trombone_BF.mp3",
+      G3: "08-G3_Trombone_BF.mp3",
+      "A#3": "09-As3_Trombone_BF.mp3",
+      "C#4": "10-Cs4_Trombone_BF.mp3",
+      E4: "11-E4_Trombone_BF.mp3",
+      G4: "12-G4_Trombone_BF.mp3",
+      "A#4": "13-As4_Trombone_BF.mp3",
+    },
+  },
+  trumpetBF: {
+    folder: "Trumpet-BF",
+    label: "Trompeta BF",
+    fallback: "organ",
+    sustain: true,
+    notes: ["F#3", "A3", "C4", "D#4", "F#4", "A4", "C5", "D#5", "F#5", "A5", "B5"],
+    files: {
+      "F#3": "01-Fs3_Trumpet_BF.mp3",
+      A3: "02-A3_Trumpet_BF.mp3",
+      C4: "03-C4_Trumpet_BF.mp3",
+      "D#4": "04-Ds4_Trumpet_BF.mp3",
+      "F#4": "05-Fs4_Trumpet_BF.mp3",
+      A4: "06-A4_Trumpet_BF.mp3",
+      C5: "07-C5_Trumpet_BF.mp3",
+      "D#5": "08-Ds5_Trumpet_BF.mp3",
+      "F#5": "09-Fs5_Trumpet_BF.mp3",
+      A5: "10-A5_Trumpet_BF.mp3",
+      B5: "11-B5_Trumpet_BF.mp3",
+    },
+  },
+  trumpetSO: {
+    folder: "Trumpet-SO",
+    label: "Trompeta SO",
+    fallback: "organ",
+    sustain: true,
+    notes: ["G3", "A#3", "C#4", "E4", "G4", "A#4", "C#5", "E5", "G5"],
+    files: {
+      G3: "01-G3_Trumpet_SO.mp3",
+      "A#3": "02-As3_Trumpet_SO.mp3",
+      "C#4": "03-Cs4_Trumpet_SO.mp3",
+      E4: "04-E4_Trumpet_SO.mp3",
+      G4: "05-G4_Trumpet_SO.mp3",
+      "A#4": "06-As4_Trumpet_SO.mp3",
+      "C#5": "07-Cs5_Trumpet_SO.mp3",
+      E5: "08-E5_Trumpet_SO.mp3",
+      G5: "09-G5_Trumpet_SO.mp3",
+    },
+  },
+  tubaBF: {
+    folder: "Tuba-BF",
+    label: "Tuba BF",
+    fallback: "organ",
+    sustain: true,
+    notes: ["D#1", "F#1", "A1", "C2", "D#2", "F#2", "A2", "C3", "D#3", "F#3", "A3", "C4", "D#4"],
+    files: {
+      "D#1": "01-Ds1_Tuba_BF.mp3",
+      "F#1": "02-Fs1_Tuba_BF.mp3",
+      A1: "03-A1_Tuba_BF.mp3",
+      C2: "04-C2_Tuba_BF.mp3",
+      "D#2": "05-Ds2_Tuba_BF.mp3",
+      "F#2": "06-Fs2_Tuba_BF.mp3",
+      A2: "07-A2_Tuba_BF.mp3",
+      C3: "08-C3_Tuba_BF.mp3",
+      "D#3": "09-Ds3_Tuba_BF.mp3",
+      "F#3": "10-Fs3_Tuba_BF.mp3",
+      A3: "11-A3_Tuba_BF.mp3",
+      C4: "12-C4_Tuba_BF.mp3",
+      "D#4": "13-Ds4_Tuba_BF.mp3",
+    },
+  },
+  violinBF: {
+    folder: "Violin-BF",
+    label: "Violín BF",
+    fallback: "strings",
+    sustain: true,
+    notes: ["G3", "A#3", "C#4", "E4", "G4", "A#4", "C#5", "E5", "G5", "A#5", "C#6", "E6", "G6", "A#6", "C#7"],
+    files: {
+      G3: "01-G3_Violin_BF.mp3",
+      "A#3": "02-As3_Violin_BF.mp3",
+      "C#4": "03-Cs4_Violin_BF.mp3",
+      E4: "04-E4_Violin_BF.mp3",
+      G4: "05-G4_Violin_BF.mp3",
+      "A#4": "06-As4_Violin_BF.mp3",
+      "C#5": "07-Cs5_Violin_BF.mp3",
+      E5: "08-E5_Violin_BF.mp3",
+      G5: "09-G5_Violin_BF.mp3",
+      "A#5": "10-As5_Violin_BF.mp3",
+      "C#6": "11-Cs6_Violin_BF.mp3",
+      E6: "12-E6_Violin_BF.mp3",
+      G6: "13-G6_Violin_BF.mp3",
+      "A#6": "14-As6_Violin_BF.mp3",
+      "C#7": "15-Cs7_Violin_BF.mp3",
+    },
+  },
+};
+function buildR2AuralSamples(bankKey) {
+  const bank = AURAL_R2_SAMPLE_BANKS[bankKey];
+  if (!bank) return null;
+
+  // Versión estricta: usa únicamente los nombres exactos que existen en R2.
+  // Antes se generaban fallbacks como E5.mp3; por eso el navegador intentaba
+  // URLs que no existen y terminaba con 404.
+  const entries = Object.entries(bank.files ?? {});
+  if (entries.length === 0) return null;
+
+  const samples = entries
+    .map(([noteName, filename]) => {
+      const midi = auralSampleNoteToMidi(noteName);
+      if (!Number.isFinite(midi) || !filename) return null;
+      return {
+        midi,
+        noteName,
+        url: r2PathUrl("samples", bank.folder, filename),
+        urlFallbacks: [],
+      };
+    })
+    .filter(Boolean);
+
+  if (typeof console !== "undefined") {
+    console.info(`[aural] R2 ${bankKey}: ${samples.length} URLs exactas`, samples.map((s) => s.url));
+  }
+
+  return samples;
+}
+
+function createR2AuralInstrument(ctx, bankKey, routingGain) {
+  const samples = buildR2AuralSamples(bankKey);
+  if (!samples || samples.length === 0) return null;
+  return createUrlSampleBank(ctx, samples, routingGain);
+}
+
+
 const INSTRUMENTS = [
-  // Voces
-  { value: "voiceOohs", label: "Voces · Oohs", soundfont: "voice_oohs", fallback: "voice", sustain: true },
+  { value: "piano", label: "Teclados · Piano acústico", displayLabel: "Piano acústico", family: "Teclados", soundfont: "acoustic_grand_piano", fallback: "piano", sustain: false, gainMultiplier: 1.05 },
 
-  // Teclados
-  { value: "piano", label: "Teclados · Piano acústico", soundfont: "acoustic_grand_piano", fallback: "piano", sustain: false },
-  { value: "electricPiano1", label: "Teclados · Piano eléctrico I", soundfont: "electric_piano_1", fallback: "piano", sustain: false },
-  { value: "electricPiano2", label: "Teclados · Piano eléctrico II", soundfont: "electric_piano_2", fallback: "piano", sustain: false },
-  { value: "harpsichord", label: "Teclados · Clave / harpsichord", soundfont: "harpsichord", fallback: "piano", sustain: false },
-  { value: "clavinet", label: "Teclados · Clavinet", soundfont: "clavinet", fallback: "piano", sustain: false },
-  { value: "musicBox", label: "Teclados · Caja de música", soundfont: "music_box", fallback: "mallet", sustain: false },
+  // Alientos madera · Método Aural
+  { value: "r2FluteSPO", label: "Alientos madera · Flauta", displayLabel: "Flauta", family: "Alientos madera", engine: "r2SampleBank", r2Key: "fluteSPO", fallback: "voice", sustain: true, gainMultiplier: 0.92 },
+  { value: "r2OboeSW", label: "Alientos madera · Oboe", displayLabel: "Oboe", family: "Alientos madera", engine: "r2SampleBank", r2Key: "oboeSW", fallback: "voice", sustain: true, gainMultiplier: 0.9 },
+  { value: "r2OboeBF", label: "Alientos madera · Oboe 2", displayLabel: "Oboe 2", family: "Alientos madera", engine: "r2SampleBank", r2Key: "oboeBF", fallback: "voice", sustain: true, gainMultiplier: 0.9 },
+  { value: "r2ClarinetBF", label: "Alientos madera · Clarinete", displayLabel: "Clarinete", family: "Alientos madera", engine: "r2SampleBank", r2Key: "clarinetBF", fallback: "voice", sustain: true, gainMultiplier: 0.92 },
+  { value: "r2BassoonSO", label: "Alientos madera · Fagot", displayLabel: "Fagot", family: "Alientos madera", engine: "r2SampleBank", r2Key: "bassoonSO", fallback: "voice", sustain: true, gainMultiplier: 0.94 },
 
-  // Órganos y lengüetas
-  { value: "drawbarOrgan", label: "Órganos · Drawbar", soundfont: "drawbar_organ", fallback: "organ", sustain: true },
-  { value: "percussiveOrgan", label: "Órganos · Percusivo", soundfont: "percussive_organ", fallback: "organ", sustain: true },
-  { value: "rockOrgan", label: "Órganos · Rock", soundfont: "rock_organ", fallback: "organ", sustain: true },
-  { value: "accordion", label: "Lengüetas · Acordeón", soundfont: "accordion", fallback: "organ", sustain: true },
-  { value: "harmonica", label: "Lengüetas · Armónica", soundfont: "harmonica", fallback: "voice", sustain: true },
+  // Metales · Método Aural
+  { value: "r2HornSY", label: "Metales · Corno francés", displayLabel: "Corno francés", family: "Metales", engine: "r2SampleBank", r2Key: "hornSY", fallback: "organ", sustain: true, gainMultiplier: 0.88 },
+  { value: "r2TromboneBF", label: "Metales · Trombón", displayLabel: "Trombón", family: "Metales", engine: "r2SampleBank", r2Key: "tromboneBF", fallback: "organ", sustain: true, gainMultiplier: 0.86 },
+  { value: "r2TrumpetBF", label: "Metales · Trompeta", displayLabel: "Trompeta", family: "Metales", engine: "r2SampleBank", r2Key: "trumpetBF", fallback: "organ", sustain: true, gainMultiplier: 0.82 },
+  { value: "r2TrumpetSO", label: "Metales · Trompeta 2", displayLabel: "Trompeta 2", family: "Metales", engine: "r2SampleBank", r2Key: "trumpetSO", fallback: "organ", sustain: true, gainMultiplier: 0.82 },
+  { value: "r2TubaBF", label: "Metales · Tuba", displayLabel: "Tuba", family: "Metales", engine: "r2SampleBank", r2Key: "tubaBF", fallback: "organ", sustain: true, gainMultiplier: 0.9 },
 
-  // Cuerdas orquestales
-  { value: "violin", label: "Cuerdas · Violín", soundfont: "violin", fallback: "strings", sustain: true },
-  { value: "viola", label: "Cuerdas · Viola", soundfont: "viola", fallback: "strings", sustain: true },
-  { value: "cello", label: "Cuerdas · Violonchelo", soundfont: "cello", fallback: "strings", sustain: true },
-  { value: "contrabass", label: "Cuerdas · Contrabajo", soundfont: "contrabass", fallback: "strings", sustain: true },
-  { value: "strings", label: "Cuerdas · Ensamble", soundfont: "string_ensemble_2", fallback: "strings", sustain: true },
-  { value: "pizzicatoStrings", label: "Cuerdas · Pizzicato", soundfont: "pizzicato_strings", fallback: "mallet", sustain: false },
-  { value: "synthStrings1", label: "Cuerdas · Sintéticas I", soundfont: "synth_strings_1", fallback: "strings", sustain: true },
-  { value: "synthStrings2", label: "Cuerdas · Sintéticas II", soundfont: "synth_strings_2", fallback: "strings", sustain: true },
-  { value: "orchestralHarp", label: "Cuerdas · Arpa orquestal", soundfont: "orchestral_harp", fallback: "piano", sustain: false },
+  // Cuerdas · Método Aural
+  { value: "r2StringQuartetAB", label: "Cuerdas · Cuarteto de cuerdas", displayLabel: "Cuarteto de cuerdas", family: "Cuerdas", engine: "r2SampleBank", r2Key: "stringQuartetAB", fallback: "strings", sustain: true, gainMultiplier: 0.86 },
+  { value: "r2ViolinBF", label: "Cuerdas · Violín", displayLabel: "Violín", family: "Cuerdas", engine: "r2SampleBank", r2Key: "violinBF", fallback: "strings", sustain: true, gainMultiplier: 0.86 },
 
-  // Alientos / maderas
-  { value: "piccolo", label: "Alientos · Piccolo", soundfont: "piccolo", fallback: "voice", sustain: true },
-  { value: "flute", label: "Alientos · Flauta", soundfont: "flute", fallback: "voice", sustain: true },
-  { value: "recorder", label: "Alientos · Flauta dulce", soundfont: "recorder", fallback: "voice", sustain: true },
-  { value: "panFlute", label: "Alientos · Flauta de pan", soundfont: "pan_flute", fallback: "voice", sustain: true },
-  { value: "whistle", label: "Alientos · Silbato", soundfont: "whistle", fallback: "voice", sustain: true },
-  { value: "ocarina", label: "Alientos · Ocarina", soundfont: "ocarina", fallback: "voice", sustain: true },
-  { value: "oboe", label: "Alientos · Oboe", soundfont: "oboe", fallback: "voice", sustain: true },
-  { value: "englishHorn", label: "Alientos · Corno inglés", soundfont: "english_horn", fallback: "voice", sustain: true },
-  { value: "clarinet", label: "Alientos · Clarinete", soundfont: "clarinet", fallback: "voice", sustain: true },
-  { value: "bassoon", label: "Alientos · Fagot", soundfont: "bassoon", fallback: "voice", sustain: true },
-  { value: "sopranoSax", label: "Saxofones · Soprano", soundfont: "soprano_sax", fallback: "voice", sustain: true },
-  { value: "altoSax", label: "Saxofones · Alto", soundfont: "alto_sax", fallback: "voice", sustain: true },
-  { value: "tenorSax", label: "Saxofones · Tenor", soundfont: "tenor_sax", fallback: "voice", sustain: true },
-  { value: "baritoneSax", label: "Saxofones · Barítono", soundfont: "baritone_sax", fallback: "voice", sustain: true },
-
-  // Metales
-  { value: "trumpet", label: "Metales · Trompeta", soundfont: "trumpet", fallback: "organ", sustain: true },
-  { value: "mutedTrumpet", label: "Metales · Trompeta con sordina", soundfont: "muted_trumpet", fallback: "organ", sustain: true },
-  { value: "frenchHorn", label: "Metales · Corno francés", soundfont: "french_horn", fallback: "organ", sustain: true },
-  { value: "trombone", label: "Metales · Trombón", soundfont: "trombone", fallback: "organ", sustain: true },
-  { value: "tuba", label: "Metales · Tuba", soundfont: "tuba", fallback: "organ", sustain: true },
-
-  // Percusión afinada
-  { value: "timpani", label: "Percusión afinada · Timbales sinfónicos", soundfont: "timpani", fallback: "mallet", sustain: false },
-  { value: "glockenspiel", label: "Percusión afinada · Glockenspiel", soundfont: "glockenspiel", fallback: "mallet", sustain: false },
-  { value: "xylophone", label: "Percusión afinada · Xilófono", soundfont: "xylophone", fallback: "mallet", sustain: false },
-  { value: "marimba", label: "Percusión afinada · Marimba", soundfont: "marimba", fallback: "mallet", sustain: false },
-  { value: "vibraphone", label: "Percusión afinada · Vibráfono", soundfont: "vibraphone", fallback: "mallet", sustain: false },
-
-  // Cuerdas pulsadas / populares
-  { value: "nylonGuitar", label: "Cuerdas pulsadas · Guitarra de nylon", soundfont: "acoustic_guitar_nylon", fallback: "piano", sustain: false },
-  { value: "steelGuitar", label: "Cuerdas pulsadas · Guitarra acústica", soundfont: "acoustic_guitar_steel", fallback: "piano", sustain: false },
-  { value: "cleanGuitar", label: "Cuerdas pulsadas · Guitarra eléctrica clean", soundfont: "electric_guitar_clean", fallback: "piano", sustain: false },
-  { value: "mutedGuitar", label: "Cuerdas pulsadas · Guitarra eléctrica muted", soundfont: "electric_guitar_muted", fallback: "piano", sustain: false },
-  { value: "overdrivenGuitar", label: "Cuerdas pulsadas · Guitarra overdrive", soundfont: "overdriven_guitar", fallback: "piano", sustain: false },
-  { value: "distortionGuitar", label: "Cuerdas pulsadas · Guitarra distorsionada", soundfont: "distortion_guitar", fallback: "piano", sustain: false },
-  { value: "koto", label: "Cuerdas pulsadas · Koto", soundfont: "koto", fallback: "piano", sustain: false },
-  { value: "fingerBass", label: "Bajos · Eléctrico finger", soundfont: "electric_bass_finger", fallback: "bass", sustain: false },
-  { value: "pickBass", label: "Bajos · Eléctrico pick", soundfont: "electric_bass_pick", fallback: "bass", sustain: false },
-
-  // Sintetizadores · leads
-  { value: "leadSquare", label: "Lead 1 · Square", soundfont: "lead_1_square", fallback: "organ", sustain: true },
-  { value: "leadSaw", label: "Lead 2 · Sawtooth", soundfont: "lead_2_sawtooth", fallback: "organ", sustain: true },
-  { value: "leadCalliope", label: "Lead 3 · Calliope", soundfont: "lead_3_calliope", fallback: "organ", sustain: true },
-  { value: "leadChiff", label: "Lead 4 · Chiff", soundfont: "lead_4_chiff", fallback: "organ", sustain: true },
-  { value: "leadVoice", label: "Lead 5 · Voice", soundfont: "lead_6_voice", fallback: "organ", sustain: true },
-  { value: "leadBass", label: "Lead 6 · Bass + Lead", soundfont: "lead_8_bass__lead", fallback: "organ", sustain: true },
-
-  // Sintetizadores · pads
-  { value: "warmPad", label: "Pad 1 · Warm", soundfont: "pad_2_warm", fallback: "strings", sustain: true },
-  { value: "padPolysynth", label: "Pad 2 · Polysynth", soundfont: "pad_3_polysynth", fallback: "strings", sustain: true },
-  { value: "padBowed", label: "Pad 3 · Bowed", soundfont: "pad_5_bowed", fallback: "strings", sustain: true },
-  { value: "padMetallic", label: "Pad 4 · Metallic", soundfont: "pad_6_metallic", fallback: "strings", sustain: true },
-  { value: "padHalo", label: "Pad 5 · Halo", soundfont: "pad_7_halo", fallback: "strings", sustain: true },
-
-  // Sintetizadores · FX
-  { value: "fxRain", label: "FX 1 · Rain", soundfont: "fx_1_rain", fallback: "organ", sustain: true },
-  { value: "fxSoundtrack", label: "FX 2 · Soundtrack", soundfont: "fx_2_soundtrack", fallback: "organ", sustain: true },
-  { value: "fxCrystal", label: "FX 3 · Crystal", soundfont: "fx_3_crystal", fallback: "organ", sustain: true },
-  { value: "fxBrightness", label: "FX 4 · Brightness", soundfont: "fx_5_brightness", fallback: "organ", sustain: true },
-  { value: "fxEchoes", label: "FX 5 · Echoes", soundfont: "fx_7_echoes", fallback: "organ", sustain: true },
+  // Voces · Método Aural
+  { value: "r2ChoirCL", label: "Voces · Coro", displayLabel: "Coro", family: "Voces", engine: "r2SampleBank", r2Key: "choirCL", fallback: "voice", sustain: true, gainMultiplier: 0.84 },
 ];
+
+const INSTRUMENT_FAMILIES = ["Teclados", "Alientos madera", "Metales", "Cuerdas", "Voces"];
+
+const INSTRUMENTS_BY_FAMILY = INSTRUMENT_FAMILIES.map((family) => ({
+  family,
+  instruments: INSTRUMENTS.filter((instrument) => instrument.family === family),
+})).filter((group) => group.instruments.length > 0);
+
+function getInstrumentDisplayName(instrument) {
+  if (!instrument) return "";
+  return instrument.displayLabel ?? instrument.label ?? instrument.value;
+}
 
 function getInstrumentConfig(value) {
   return INSTRUMENTS.find((item) => item.value === value) ?? INSTRUMENTS.find((item) => item.value === "piano") ?? INSTRUMENTS[0];
@@ -911,7 +1340,7 @@ function getInstrumentConfig(value) {
 
 function getInstrumentGainMultiplier(instrumentOrValue) {
   const config = typeof instrumentOrValue === "string" ? getInstrumentConfig(instrumentOrValue) : instrumentOrValue;
-  const multiplier = Number(config?.gainMultiplier ?? 1);
+  const multiplier = Number(config?.gainMultiplier ?? config?.__auralGainMultiplier ?? 1);
   return Number.isFinite(multiplier) && multiplier > 0 ? multiplier : 1;
 }
 
@@ -1206,10 +1635,12 @@ function noteName(note) {
   return `${LETTER_TO_SPANISH[note.letter]}${accidental}${note.octave}`;
 }
 
-function staffKey(note) {
+function staffKey(note, clef = null) {
   if (!note) return "c/4";
   const accidental = ACCIDENTAL_TO_ASCII[note.accidental] ?? "";
-  return `${note.letter.toLowerCase()}${accidental}/${note.octave}`;
+  const octaveShift = Number(clef?.displayOctaveShift ?? 0);
+  const displayOctave = note.octave + (Number.isFinite(octaveShift) ? octaveShift : 0);
+  return `${note.letter.toLowerCase()}${accidental}/${displayOctave}`;
 }
 
 function getKeyConfig(id) {
@@ -3054,6 +3485,7 @@ function initialSettings() {
     const merged = { ...defaultSettings(), ...(stored ?? {}) };
     return {
       ...merged,
+      trainerMode: "melodicFunctions",
       modeScope: ["major", "minor", "randomMode", "majorMinor"].includes(merged.modeScope) ? merged.modeScope : "randomMode",
       selectedDegrees: Array.isArray(merged.selectedDegrees) && merged.selectedDegrees.length ? merged.selectedDegrees.filter((degree) => degree >= 1 && degree <= 7) : [1, 2, 3],
       selectedKeys: Array.isArray(merged.selectedKeys) ? merged.selectedKeys.filter((id) => KEY_OPTIONS.some((key) => key.id === id)) : KEY_OPTIONS.map((key) => key.id),
@@ -3061,6 +3493,8 @@ function initialSettings() {
       alteredForms: Array.isArray(merged.alteredForms) ? merged.alteredForms.filter((key) => ALTERED_FORM_OPTIONS.some((item) => item.key === key)) : ALTERED_FORM_OPTIONS.map((item) => item.key),
       selectedAlteredMajorTokens: sanitizeAlteredTokens(merged.selectedAlteredMajorTokens, "major"),
       selectedAlteredMinorTokens: sanitizeAlteredTokens(merged.selectedAlteredMinorTokens, "minor"),
+      includeAltered: false,
+      compound: false,
       minorScales: Array.isArray(merged.minorScales) && merged.minorScales.length ? merged.minorScales.filter((key) => ["naturalMinor", "harmonicMinor", "melodicMinor"].includes(key)) : ["harmonicMinor"],
       speed: clamp(Number(merged.speed) || DEFAULT_SPEED, 10, 200),
       volume: clamp(Number(merged.volume) || DEFAULT_VOLUME, 0, 100),
@@ -4366,7 +4800,7 @@ function TonalStaff({ exercise, attempts, reveal, onNotePress }) {
 
         const staveNote = new StaveNote({
           clef: clef.vex,
-          keys: group.map(({ note }) => staffKey(note)),
+          keys: group.map(({ note }) => staffKey(note, clef)),
           duration: "w",
         });
 
@@ -5487,7 +5921,7 @@ export default function TonalFunctionsTrainer() {
     selectedClefs,
     modeScope,
     minorScales,
-    includeAltered,
+    includeAltered: false,
     alteredForms,
     selectedAlteredMajorTokens,
     selectedAlteredMinorTokens,
@@ -5500,7 +5934,7 @@ export default function TonalFunctionsTrainer() {
     randomInstrumentMode,
     randomInstrumentEnabled,
     randomizeInstrumentOnExercise,
-    compound,
+    compound: false,
     twoVoice,
     selectedDyadFamilies,
     dyadDirection: "auto",
@@ -5685,12 +6119,36 @@ export default function TonalFunctionsTrainer() {
     const context = await ensureAudio();
     if (!context) return null;
     const config = getInstrumentConfig(instrumentValue);
-    const cacheKey = `${config.soundfont}-${SOUNDFONT_LIBRARY}`;
+    const cacheKey = config.engine === "r2SampleBank"
+      ? `r2SampleBank-${config.r2Key}`
+      : `${config.soundfont}-${SOUNDFONT_LIBRARY}`;
     if (soundfontCacheRef.current.has(cacheKey)) {
       const cachedPlayer = soundfontCacheRef.current.get(cacheKey);
       cachedPlayer.__auralGainMultiplier = getInstrumentGainMultiplier(config);
       return cachedPlayer;
     }
+
+    if (config.engine === "r2SampleBank") {
+      const routingGain = context.createGain();
+      routingGain.gain.value = 1;
+      routingGain.connect(context.destination);
+      const player = createR2AuralInstrument(context, config.r2Key, routingGain);
+      if (player?.loaded && typeof player.loaded.then === "function") {
+        try {
+          await player.loaded;
+        } catch (error) {
+          console.warn("No se pudieron cargar las muestras de Método Aural; usando oscilador interno:", error);
+          try { routingGain.disconnect(); } catch {}
+          return null;
+        }
+      }
+      if (player) {
+        player.__auralGainMultiplier = getInstrumentGainMultiplier(config);
+        soundfontCacheRef.current.set(cacheKey, player);
+      }
+      return player;
+    }
+
     try {
       const player = await Soundfont.instrument(context, config.soundfont, {
         format: "mp3",
@@ -6224,21 +6682,6 @@ export default function TonalFunctionsTrainer() {
                 <h1 className="mt-1 text-3xl font-bold tracking-tight text-zinc-950 sm:text-4xl">Entrenador de música tonal</h1>
               </div>
               <div className="flex items-center gap-2">
-                <div className="flex rounded-2xl border border-zinc-200 bg-white p-1 shadow-sm">
-                  {TRAINER_MODES.map((mode) => (
-                    <button
-                      type="button"
-                      key={mode}
-                      onClick={() => {
-                        setTrainerMode(mode);
-                        if (mode === "harmonicFunctions") setSpeed(DEFAULT_HARMONIC_SPEED);
-                      }}
-                      className={`rounded-xl px-3 py-2 text-sm font-semibold transition ${trainerMode === mode ? "aural-mode-active" : "text-zinc-600 hover:bg-zinc-100"}`}
-                    >
-                      {MODE_LABELS[mode]}
-                    </button>
-                  ))}
-                </div>
                 <button
                   type="button"
                   onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
@@ -6468,59 +6911,6 @@ export default function TonalFunctionsTrainer() {
                   ) : null}
                 </div>
 
-                <div className="space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <span className="text-sm font-medium text-zinc-700">Grados alterados</span>
-                    <SelectionChip active={includeAltered} onClick={() => setIncludeAltered((current) => !current)}>{includeAltered ? "Activos" : "Inactivos"}</SelectionChip>
-                  </div>
-                  {includeAltered ? (
-                    <div className="space-y-3">
-                      <div className="space-y-3">
-                        {modeScope !== "minor" ? (
-                          <AlteredDegreeSelector
-                            mode="major"
-                            label="Modo mayor"
-                            selectedTokens={selectedAlteredMajorTokens}
-                            onToggle={(token) => toggleAlteredToken("major", token)}
-                            onSelectAll={() => selectAllAlteredTokens("major")}
-                            onDeselectAll={() => deselectAllAlteredTokens("major")}
-                          />
-                        ) : null}
-                        {modeScope !== "major" ? (
-                          <AlteredDegreeSelector
-                            mode="minor"
-                            label="Modo menor"
-                            selectedTokens={selectedAlteredMinorTokens}
-                            onToggle={(token) => toggleAlteredToken("minor", token)}
-                            onSelectAll={() => selectAllAlteredTokens("minor")}
-                            onDeselectAll={() => deselectAllAlteredTokens("minor")}
-                          />
-                        ) : null}
-                      </div>
-                      <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2.5">
-                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                          <span className="text-xs font-semibold uppercase tracking-[0.16em] text-zinc-500">Formas de aparición</span>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button type="button" onClick={() => setAlteredForms(ALTERED_FORM_OPTIONS.map((item) => item.key))} className="rounded-full border border-zinc-300 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 transition hover:border-zinc-500">Seleccionar todas</button>
-                            <button type="button" onClick={() => setAlteredForms([])} className="rounded-full border border-zinc-300 bg-white px-2.5 py-1 text-[11px] font-medium text-zinc-700 transition hover:border-zinc-500">Deseleccionar todas</button>
-                            <Badge>{alteredForms.length} activas</Badge>
-                          </div>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {ALTERED_FORM_OPTIONS.map((item) => <SelectionChip key={item.key} active={alteredForms.includes(item.key)} onClick={() => toggleAlteredForm(item.key)}>{item.label}</SelectionChip>)}
-                        </div>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-
-                <div className="space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <span className="text-sm font-medium text-zinc-700">Intervalos compuestos</span>
-                    <SelectionChip active={compound} onClick={() => setCompound((current) => !current)}>{compound ? "Compuestos activos" : "Sin compuestos"}</SelectionChip>
-                  </div>
-                </div>
-
                 </>
                 )}
 
@@ -6565,7 +6955,11 @@ export default function TonalFunctionsTrainer() {
                       }}
                       className="w-full rounded-2xl border border-zinc-300 bg-white px-4 py-3 text-sm text-zinc-700 outline-none focus:border-zinc-500"
                     >
-                      {INSTRUMENTS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                      {INSTRUMENTS_BY_FAMILY.map((group) => (
+                        <optgroup key={group.family} label={group.family}>
+                          {group.instruments.map((item) => <option key={item.value} value={item.value}>{getInstrumentDisplayName(item)}</option>)}
+                        </optgroup>
+                      ))}
                     </select>
                     <div className="space-y-3 rounded-2xl border border-zinc-200 bg-zinc-50 px-3 py-3">
                       <div className="flex flex-wrap items-center justify-between gap-3">
