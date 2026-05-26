@@ -249,8 +249,6 @@ const SHARP_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#",
 const TRAINER_MODES = ["melodicFunctions", "harmonicFunctions", "tonalFunctions"];
 const MODE_LABELS = {
   melodicFunctions: "Funciones melódicas",
-  harmonicFunctions: "Funciones armónicas",
-  tonalFunctions: "Funciones tonales",
 };
 
 const KEY_OPTIONS = [
